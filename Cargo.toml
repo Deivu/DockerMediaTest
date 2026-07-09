@@ -1,0 +1,18 @@
+[package]
+name = "mediaserver"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+base64 = "0.22"
