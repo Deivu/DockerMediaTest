@@ -32,5 +32,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/shipgirlproject/dockermediatest:${{ github.sha }}
-            ghcr.io/shipgirlproject/dockermediatest:latest
+            ghcr.io/deivu/docker-media-test:${{ github.sha }}
+            ghcr.io/deivu/docker-media-test:latest
