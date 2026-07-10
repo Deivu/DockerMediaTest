@@ -1,13 +1,43 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use dashmap::DashMap;
+use socket2::{Domain, Socket, Type};
 use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 
-const UDP_EOF_SEQ: u32 = 0xFFFF_FFFF;
+static SESSIONS: LazyLock<Arc<DashMap<u32, mpsc::Sender<Vec<u8>>>>> =
+    LazyLock::new(|| Arc::new(DashMap::new()));
+const MAX_ROUNDS: u32 = 20;
+const REPORT_TIMEOUT: Duration = Duration::from_millis(1000);
+
+#[derive(PartialEq)]
+#[repr(u8)]
+enum Kind {
+    Hello = 0,
+    Data = 1,
+    Manifest = 2,
+    Missing = 3,
+}
+
+impl Kind {
+    fn from_u8(b: u8) -> Option<Kind> {
+        match b {
+            0 => Some(Kind::Hello),
+            1 => Some(Kind::Data),
+            2 => Some(Kind::Manifest),
+            3 => Some(Kind::Missing),
+            _ => None,
+        }
+    }
+}
 
 struct Config {
     bind_host: String,
@@ -99,7 +129,7 @@ fn build_gif_page(gif_bytes: &[u8]) -> Vec<u8> {
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
-    .into_bytes();
+        .into_bytes();
     resp.extend_from_slice(&body);
     resp
 }
@@ -176,6 +206,64 @@ async fn run_raw_tcp_server(host: &str, port: u16, data: Vec<u8>, label: &'stati
     }
 }
 
+#[cfg(windows)]
+fn disable_conn_reset(socket: &Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SOCKET, WSAIoctl};
+
+    const IOC_IN: u32 = 0x8000_0000;
+    const IOC_VENDOR: u32 = 0x1800_0000;
+    const SIO_UDP_CONNRESET: u32 = IOC_IN | IOC_VENDOR | 12;
+
+    let mut bytes_returned: u32 = 0;
+    let enable: u32 = 0;
+
+    let ret = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            &enable as *const u32 as *mut _,
+            size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn disable_conn_reset(_socket: &Socket) -> std::io::Result<()> {
+    Ok(())
+}
+
+async fn bind_udp(host: &str, port: u16) -> UdpSocket {
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .unwrap_or_else(|e| panic!("bad bind addr {host}:{port}: {e}"));
+
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, None)
+        .unwrap_or_else(|e| panic!("failed to create UDP socket: {e}"));
+    socket
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| panic!("failed to set nonblocking: {e}"));
+    socket
+        .bind(&addr.into())
+        .unwrap_or_else(|e| panic!("failed to bind UDP {addr}: {e}"));
+
+    if let Err(e) = disable_conn_reset(&socket) {
+        eprintln!("warning: failed to disable SIO_UDP_CONNRESET: {e}");
+    }
+
+    UdpSocket::from_std(socket.into())
+        .unwrap_or_else(|e| panic!("failed to convert to tokio UdpSocket: {e}"))
+}
+
 async fn run_udp_server(
     host: &str,
     port: u16,
@@ -183,45 +271,151 @@ async fn run_udp_server(
     label: &'static str,
     chunk_size: usize,
 ) {
-    let data = Arc::new(data);
-    let socket = Arc::new(
-        UdpSocket::bind((host, port))
-            .await
-            .unwrap_or_else(|e| panic!("failed to bind UDP {host}:{port}: {e}")),
-    );
+    let chunks: Arc<Vec<Vec<u8>>> = Arc::new(data.chunks(chunk_size).map(|c| c.to_vec()).collect());
+    let socket = Arc::new(bind_udp(host, port).await);
     println!("[UDP:{label}] listening on {host}:{port}");
 
     let mut buf = [0u8; 65535];
     loop {
-        let (_len, peer) = match socket.recv_from(&mut buf).await {
+        let (len, peer) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[UDP:{label}] recv error: {e}");
                 continue;
             }
         };
-        println!(
-            "[UDP:{label}] request from {peer}, sending {} bytes in {chunk_size}-byte chunks",
-            data.len()
-        );
-        let data = Arc::clone(&data);
-        let socket = Arc::clone(&socket);
-        tokio::spawn(async move {
-            let mut seq: u32 = 0;
-            for chunk in data.chunks(chunk_size) {
-                let mut packet = Vec::with_capacity(4 + chunk.len());
-                packet.extend_from_slice(&seq.to_be_bytes());
-                packet.extend_from_slice(chunk);
-                if let Err(e) = socket.send_to(&packet, peer).await {
-                    eprintln!("[UDP:{label}] send error to {peer}: {e}");
+
+        if len < 5 {
+            eprintln!("[UDP:{label}] {peer} sent undersized packet ({len} bytes), dropping");
+            continue;
+        }
+
+        let kind = match Kind::from_u8(buf[0]) {
+            Some(k) => k,
+            None => {
+                eprintln!(
+                    "[UDP:{label}] {peer} sent unknown kind byte {}, dropping",
+                    buf[0]
+                );
+                continue;
+            }
+        };
+        let request_id = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+        let is_known_session = SESSIONS.contains_key(&request_id);
+
+        match kind {
+            Kind::Hello if !is_known_session => {
+                if len != 5 {
+                    eprintln!("[UDP:{label}] {peer} malformed Hello (len {len}), dropping");
+                    continue;
+                }
+                println!(
+                    "[UDP:{label}] hello from {peer}, request_id={request_id}, {} chunks",
+                    chunks.len()
+                );
+                let (tx, rx) = mpsc::channel(8);
+                SESSIONS.insert(request_id, tx);
+                let chunks = Arc::clone(&chunks);
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    handle_request(&socket, peer, request_id, &chunks, rx, label).await;
+                    SESSIONS.remove(&request_id);
+                });
+            }
+
+            Kind::Missing if is_known_session => {
+                if len < 5 || (len - 5) % 4 != 0 {
+                    eprintln!(
+                        "[UDP:{label}] {peer} malformed Missing for request {request_id} (len {len}), terminating session"
+                    );
+                    SESSIONS.remove(&request_id);
+                    continue;
+                }
+                if let Some(tx) = SESSIONS.get(&request_id) {
+                    let _ = tx.send(buf[..len].to_vec()).await;
+                }
+            }
+
+            _ => {
+                eprintln!(
+                    "[UDP:{label}] {peer} sent unexpected kind for request {request_id} (known_session={is_known_session}), terminating session"
+                );
+                SESSIONS.remove(&request_id);
+            }
+        }
+    }
+}
+
+async fn handle_request(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    request_id: u32,
+    chunks: &[Vec<u8>],
+    mut reports: mpsc::Receiver<Vec<u8>>,
+    label: &'static str,
+) {
+    let total = chunks.len() as u32;
+    let mut pending: Vec<u32> = (0..total).collect();
+
+    for round in 0..MAX_ROUNDS {
+        if pending.is_empty() {
+            break;
+        }
+
+        for &seq in &pending {
+            let chunk = &chunks[seq as usize];
+            let mut pkt = Vec::with_capacity(9 + chunk.len());
+            pkt.push(Kind::Data as u8);
+            pkt.extend_from_slice(&request_id.to_be_bytes());
+            pkt.extend_from_slice(&seq.to_be_bytes());
+            pkt.extend_from_slice(chunk);
+            if let Err(e) = socket.send_to(&pkt, peer).await {
+                eprintln!("[UDP:{label}] send error to {peer}: {e}");
+                return;
+            }
+        }
+
+        let mut manifest = Vec::with_capacity(9);
+        manifest.push(Kind::Manifest as u8);
+        manifest.extend_from_slice(&request_id.to_be_bytes());
+        manifest.extend_from_slice(&total.to_be_bytes());
+        let _ = socket.send_to(&manifest, peer).await;
+
+        match timeout(REPORT_TIMEOUT, reports.recv()).await {
+            Ok(Some(report)) => {
+                pending = parse_missing(&report);
+                if pending.is_empty() {
+                    println!("[UDP:{label}] request {request_id} ({peer}) complete, round {round}");
                     return;
                 }
-                seq = seq.wrapping_add(1);
+                println!(
+                    "[UDP:{label}] request {request_id} missing {} chunks, round {round}",
+                    pending.len()
+                );
             }
-            let _ = socket.send_to(&UDP_EOF_SEQ.to_be_bytes(), peer).await;
-            println!("[UDP:{label}] finished sending to {peer} ({seq} chunks)");
-        });
+            Ok(None) => {
+                println!("[UDP:{label}] request {request_id} session terminated, aborting send");
+                return;
+            }
+            Err(_) => {
+                println!(
+                    "[UDP:{label}] request {request_id} report timeout, resending {} chunks",
+                    pending.len()
+                );
+            }
+        }
     }
+    eprintln!(
+        "[UDP:{label}] request {request_id} gave up after {MAX_ROUNDS} rounds, {} still missing",
+        pending.len()
+    );
+}
+
+fn parse_missing(buf: &[u8]) -> Vec<u32> {
+    buf[5..]
+        .chunks_exact(4)
+        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+        .collect()
 }
 
 #[tokio::main]

@@ -17,3 +17,7 @@ panic = "abort"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 base64 = "0.22"
+dashmap = "6.2.1"
+socket2 = "0.6.4"
+[target.'cfg(windows)'.dependencies]
+windows-sys = "0.61.2"
