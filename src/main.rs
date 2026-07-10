@@ -4,9 +4,10 @@ use socket2::{Domain, Socket, Type};
 use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -15,25 +16,27 @@ use tokio::time::timeout;
 
 static SESSIONS: LazyLock<Arc<DashMap<u32, mpsc::Sender<Vec<u8>>>>> =
     LazyLock::new(|| Arc::new(DashMap::new()));
-const MAX_ROUNDS: u32 = 20;
-const REPORT_TIMEOUT: Duration = Duration::from_millis(1000);
+
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(PartialEq)]
 #[repr(u8)]
 enum Kind {
-    Hello = 0,
-    Data = 1,
-    Manifest = 2,
-    Missing = 3,
+    Hi = 0,
+    Hello = 1,
+    Data = 2,
+    Request = 3,
+    Done = 4,
 }
 
 impl Kind {
     fn from_u8(b: u8) -> Option<Kind> {
         match b {
-            0 => Some(Kind::Hello),
-            1 => Some(Kind::Data),
-            2 => Some(Kind::Manifest),
-            3 => Some(Kind::Missing),
+            0 => Some(Kind::Hi),
+            1 => Some(Kind::Hello),
+            2 => Some(Kind::Data),
+            3 => Some(Kind::Request),
+            4 => Some(Kind::Done),
             _ => None,
         }
     }
@@ -209,7 +212,7 @@ async fn run_raw_tcp_server(host: &str, port: u16, data: Vec<u8>, label: &'stati
 #[cfg(windows)]
 fn disable_conn_reset(socket: &Socket) -> std::io::Result<()> {
     use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{SOCKET, WSAIoctl};
+    use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SOCKET};
 
     const IOC_IN: u32 = 0x8000_0000;
     const IOC_VENDOR: u32 = 0x1800_0000;
@@ -264,6 +267,22 @@ async fn bind_udp(host: &str, port: u16) -> UdpSocket {
         .unwrap_or_else(|e| panic!("failed to convert to tokio UdpSocket: {e}"))
 }
 
+static ID_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+fn generate_request_id() -> u32 {
+    loop {
+        let counter = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let candidate = counter ^ nanos;
+        if candidate != 0 && !SESSIONS.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+}
+
 async fn run_udp_server(
     host: &str,
     port: u16,
@@ -300,21 +319,32 @@ async fn run_udp_server(
                 continue;
             }
         };
-        let request_id = u32::from_be_bytes(buf[1..5].try_into().unwrap());
-        let is_known_session = SESSIONS.contains_key(&request_id);
 
         match kind {
-            Kind::Hello if !is_known_session => {
+            Kind::Hi => {
                 if len != 5 {
-                    eprintln!("[UDP:{label}] {peer} malformed Hello (len {len}), dropping");
+                    eprintln!("[UDP:{label}] {peer} malformed Hi (len {len}), dropping");
                     continue;
                 }
+                let request_id = generate_request_id();
                 println!(
-                    "[UDP:{label}] hello from {peer}, request_id={request_id}, {} chunks",
+                    "[UDP:{label}] hi from {peer}, assigning request_id={request_id}, {} chunks",
                     chunks.len()
                 );
-                let (tx, rx) = mpsc::channel(8);
+
+                let (tx, rx) = mpsc::channel(32);
                 SESSIONS.insert(request_id, tx);
+
+                let mut hello = Vec::with_capacity(9);
+                hello.push(Kind::Hello as u8);
+                hello.extend_from_slice(&request_id.to_be_bytes());
+                hello.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
+                if let Err(e) = socket.send_to(&hello, peer).await {
+                    eprintln!("[UDP:{label}] failed to send Hello to {peer}: {e}");
+                    SESSIONS.remove(&request_id);
+                    continue;
+                }
+
                 let chunks = Arc::clone(&chunks);
                 let socket = Arc::clone(&socket);
                 tokio::spawn(async move {
@@ -323,10 +353,20 @@ async fn run_udp_server(
                 });
             }
 
-            Kind::Missing if is_known_session => {
-                if len < 5 || (len - 5) % 4 != 0 {
+            Kind::Request | Kind::Done => {
+                let request_id = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+                let is_known_session = SESSIONS.contains_key(&request_id);
+
+                if !is_known_session {
                     eprintln!(
-                        "[UDP:{label}] {peer} malformed Missing for request {request_id} (len {len}), terminating session"
+                        "[UDP:{label}] {peer} sent {} for unknown request {request_id}, dropping",
+                        if kind == Kind::Request { "Request" } else { "Done" }
+                    );
+                    continue;
+                }
+                if kind == Kind::Request && (len < 5 || (len - 5) % 4 != 0) {
+                    eprintln!(
+                        "[UDP:{label}] {peer} malformed Request for {request_id} (len {len}), terminating session"
                     );
                     SESSIONS.remove(&request_id);
                     continue;
@@ -336,9 +376,10 @@ async fn run_udp_server(
                 }
             }
 
-            _ => {
+            Kind::Hello | Kind::Data => {
+                let request_id = u32::from_be_bytes(buf[1..5].try_into().unwrap());
                 eprintln!(
-                    "[UDP:{label}] {peer} sent unexpected kind for request {request_id} (known_session={is_known_session}), terminating session"
+                    "[UDP:{label}] {peer} sent a server-only kind for request {request_id}, terminating session"
                 );
                 SESSIONS.remove(&request_id);
             }
@@ -351,69 +392,54 @@ async fn handle_request(
     peer: SocketAddr,
     request_id: u32,
     chunks: &[Vec<u8>],
-    mut reports: mpsc::Receiver<Vec<u8>>,
+    mut inbox: mpsc::Receiver<Vec<u8>>,
     label: &'static str,
 ) {
-    let total = chunks.len() as u32;
-    let mut pending: Vec<u32> = (0..total).collect();
-
-    for round in 0..MAX_ROUNDS {
-        if pending.is_empty() {
-            break;
-        }
-
-        for &seq in &pending {
-            let chunk = &chunks[seq as usize];
-            let mut pkt = Vec::with_capacity(9 + chunk.len());
-            pkt.push(Kind::Data as u8);
-            pkt.extend_from_slice(&request_id.to_be_bytes());
-            pkt.extend_from_slice(&seq.to_be_bytes());
-            pkt.extend_from_slice(chunk);
-            if let Err(e) = socket.send_to(&pkt, peer).await {
-                eprintln!("[UDP:{label}] send error to {peer}: {e}");
-                return;
-            }
-        }
-
-        let mut manifest = Vec::with_capacity(9);
-        manifest.push(Kind::Manifest as u8);
-        manifest.extend_from_slice(&request_id.to_be_bytes());
-        manifest.extend_from_slice(&total.to_be_bytes());
-        let _ = socket.send_to(&manifest, peer).await;
-
-        match timeout(REPORT_TIMEOUT, reports.recv()).await {
-            Ok(Some(report)) => {
-                pending = parse_missing(&report);
-                if pending.is_empty() {
-                    println!("[UDP:{label}] request {request_id} ({peer}) complete, round {round}");
+    loop {
+        match timeout(SESSION_IDLE_TIMEOUT, inbox.recv()).await {
+            Ok(Some(raw)) => match Kind::from_u8(raw[0]) {
+                Some(Kind::Request) => {
+                    let seqs = parse_seq_list(&raw[5..]);
+                    for seq in seqs {
+                        let Some(chunk) = chunks.get(seq as usize) else {
+                            eprintln!(
+                                "[UDP:{label}] request {request_id} asked for out-of-range seq {seq}, ignoring"
+                            );
+                            continue;
+                        };
+                        let mut pkt = Vec::with_capacity(9 + chunk.len());
+                        pkt.push(Kind::Data as u8);
+                        pkt.extend_from_slice(&request_id.to_be_bytes());
+                        pkt.extend_from_slice(&seq.to_be_bytes());
+                        pkt.extend_from_slice(chunk);
+                        if let Err(e) = socket.send_to(&pkt, peer).await {
+                            eprintln!("[UDP:{label}] send error to {peer}: {e}");
+                            return;
+                        }
+                    }
+                }
+                Some(Kind::Done) => {
+                    println!("[UDP:{label}] request {request_id} ({peer}) done");
                     return;
                 }
-                println!(
-                    "[UDP:{label}] request {request_id} missing {} chunks, round {round}",
-                    pending.len()
-                );
-            }
+                _ => return,
+            },
             Ok(None) => {
-                println!("[UDP:{label}] request {request_id} session terminated, aborting send");
+                println!("[UDP:{label}] request {request_id} session terminated");
                 return;
             }
             Err(_) => {
                 println!(
-                    "[UDP:{label}] request {request_id} report timeout, resending {} chunks",
-                    pending.len()
+                    "[UDP:{label}] request {request_id} idle for {SESSION_IDLE_TIMEOUT:?}, giving up"
                 );
+                return;
             }
         }
     }
-    eprintln!(
-        "[UDP:{label}] request {request_id} gave up after {MAX_ROUNDS} rounds, {} still missing",
-        pending.len()
-    );
 }
 
-fn parse_missing(buf: &[u8]) -> Vec<u32> {
-    buf[5..]
-        .chunks_exact(4)
+fn parse_seq_list(buf: &[u8]) -> Vec<u32> {
+    buf.chunks_exact(4)
         .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
         .collect()
 }
