@@ -1,11 +1,13 @@
 FROM rust:1.96-slim AS builder
-WORKDIR /build
-COPY Cargo.toml ./
-COPY src ./src
+
+WORKDIR /home/server
+COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim
-WORKDIR /app
-COPY --from=builder /build/target/release/mediaserver /app/mediaserver
+FROM debian:trixie-slim
 
-CMD ["/app/mediaserver"]
+WORKDIR /home/server
+COPY --from=builder /home/server/target/release/mediaserver /home/server/mediaserver
+COPY --from=builder /home/server/data /home/server/data
+
+ENTRYPOINT ["./mediaserver"]
